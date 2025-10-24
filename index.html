@@ -1,22 +1,406 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>ASL Live - Sign to Word (App Inventor bridge)</title>
-  <style>
-    body { margin:0; font-family: system-ui, -apple-system, Roboto, Arial; background:#1f6aa5; color:white; display:flex; flex-direction:column; align-items:center; }
-    #container { width:100%; max-width:640px; padding:12px; box-sizing:border-box; }
-    #videoWrap { position:relative; width:100%; display:flex; justify-content:center; }
-    video { width:100%; max-width:560px; border-radius:8px; }
-    canvas { position:absolute; left:0; top:0; width:100%; max-width:560px; pointer-events:none; }
-    #word { margin-top:14px; font-size:26px; font-weight:700; text-align:center; color:#fff; }
-    #controls { margin-top:12px; display:flex; gap:8px; justify-content:center; }
-    button { padding:8px 12px; border-radius:8px; border:0; font-size:16px; }
-    #notice { font-size:12px; opacity:0.9; margin-top:8px; text-align:center; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign2Text</title>
+<style>
+  body {
+    margin: 0;
+    background: #121212;
+    font-family: 'Segoe UI', Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    color: #00ffd0;
+  }
+
+  h1 {
+    margin: 20px 0;
+    font-size: 1.8rem;
+    text-align: center;
+  }
+
+  #videoWrap {
+    position: relative;
+    width: 90vw;
+    max-width: 640px;
+    aspect-ratio: 4/3;
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.5);
+    background: #222;
+  }
+
+  video, canvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1);
+  }
+
+  #word {
+    margin-top: 15px;
+    font-size: 2rem;
+    font-weight: bold;
+    text-shadow: 0 0 10px #000;
+    min-height: 2.5rem;
+    text-align: center;
+  }
+</style>
 </head>
 <body>
+
+<h1>Sign2Text</h1>
+
+<div id="videoWrap">
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div id="word">—</div>
+
+<!-- TensorFlow.js + Fingerpose -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7/dist/handpose.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/fingerpose@0.1.0/dist/fingerpose.min.js"></script>
+<script src="./handposeutil.js"></script>
+<script src="./handsigns.js"></script>
+
+<script>
+const video = document.getElementById('webcam');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+const wordEl = document.getElementById('word');
+
+let model = null;
+let constructedWord = '';
+let stableLetter = '';
+let stableCount = 0;
+const ACCEPT_THRESHOLD = 3;
+const INTERVAL_MS = 150;
+
+async function startCamera(){
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+  video.srcObject = stream;
+  await video.play();
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+}
+
+function draw(predictions){
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+  ctx.clearRect(0,0,overlay.width,overlay.height);
+  if(window.drawHand && predictions?.length) drawHand(predictions, ctx);
+}
+
+function sendToAppInventor(payload){
+  try{
+    if(window.AppInventor?.setWebViewString) AppInventor.setWebViewString(payload);
+    else if(window.parent?.AppInventor?.setWebViewString) window.parent.AppInventor.setWebViewString(payload);
+  }catch{}
+}
+
+function speakText(text){
+  if(!text) return;
+  const u = new SpeechSynthesisUtterance(text);
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(u);
+}
+
+async function loadModel(){ model = await handpose.load(); }
+
+function acceptLetter(letter){
+  constructedWord += letter;
+  wordEl.textContent = constructedWord || '—';
+  speakText(letter);
+  sendToAppInventor('WORD:' + constructedWord);
+}
+
+async function analyzeFrame(){
+  if(!model || !video.videoWidth) return;
+  const predictions = await model.estimateHands(video);
+  draw(predictions);
+
+  if(predictions?.length && window.fp && window.Handsigns){
+    const GE = new fp.GestureEstimator(Object.values(Handsigns));
+    const est = await GE.estimate(predictions[0].landmarks, 7.5);
+    if(est.gestures?.length){
+      const max = est.gestures.reduce((a,b)=>a.confidence>b.confidence?a:b);
+      let letter = max.name?.[0]?.toUpperCase() || '';
+      if(letter){
+        if(letter === stableLetter) stableCount++;
+        else { stableLetter = letter; stableCount = 1; }
+        if(stableCount >= ACCEPT_THRESHOLD){ acceptLetter(letter); stableLetter=''; stableCount=0; }
+      } else { stableLetter=''; stableCount=0; }
+    } else { stableLetter=''; stableCount=0; }
+  } else { stableLetter=''; stableCount=0; }
+}
+
+// --- Auto-start ---
+(async ()=>{
+  await startCamera();
+  await loadModel();
+  setInterval(analyzeFrame, INTERVAL_MS);
+})();
+</script>
+
+</body>
+</html>
+
+  <h1>ASL Sign → Word</h1>
+
+  <div id="videoWrap">
+    <video id="webcam" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="word">—</div>
+
+  <div id="controls">
+    <button id="start">Start</button>
+    <button id="stop">Stop</button>
+    <button id="clear">Clear Word</button>
+    <button id="speak">Speak Word</button>
+  </div>
+
+  <div id="notice">
+    Make letters with your dominant hand. The page will speak each accepted letter and update the full word. It will also send <code>WORD:&lt;yourword&gt;</code> to App Inventor via <code>AppInventor.setWebViewString</code>.
+  </div>
+
+  <!-- TensorFlow.js + Fingerpose -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7/dist/handpose.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/fingerpose@0.1.0/dist/fingerpose.min.js"></script>
+  <script src="./handposeutil.js"></script>
+  <script src="./handsigns.js"></script>
+
+  <script>
+  const video = document.getElementById('webcam');
+  const overlay = document.getElementById('overlay');
+  const ctx = overlay.getContext('2d');
+  const wordEl = document.getElementById('word');
+  const startBtn = document.getElementById('start');
+  const stopBtn = document.getElementById('stop');
+  const clearBtn = document.getElementById('clear');
+  const speakBtn = document.getElementById('speak');
+
+  let model = null;
+  let runInterval = null;
+  let running = false;
+  let constructedWord = '';
+  let stableLetter = '';
+  let stableCount = 0;
+  const ACCEPT_THRESHOLD = 3;
+  const INTERVAL_MS = 150;
+
+  async function startCamera(){
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+      video.srcObject = stream;
+      await video.play();
+      overlay.width = video.videoWidth;
+      overlay.height = video.videoHeight;
+    } catch(e) { alert('Camera error: ' + e.message); }
+  }
+
+  async function stopCamera(){
+    if(video.srcObject) video.srcObject.getTracks().forEach(t=>t.stop());
+    video.pause(); video.srcObject = null;
+  }
+
+  function draw(predictions){
+    overlay.width = video.videoWidth;
+    overlay.height = video.videoHeight;
+    ctx.clearRect(0,0,overlay.width,overlay.height);
+    if(window.drawHand && predictions?.length) drawHand(predictions, ctx);
+  }
+
+  function sendToAppInventor(payload){
+    try {
+      if(window.AppInventor?.setWebViewString) AppInventor.setWebViewString(payload);
+      else if(window.parent?.AppInventor?.setWebViewString) window.parent.AppInventor.setWebViewString(payload);
+    } catch {}
+  }
+
+  function speakText(text){
+    if(!text) return;
+    const u = new SpeechSynthesisUtterance(text);
+    window.speechSynthesis.cancel(); // cancel queued speech
+    window.speechSynthesis.speak(u);
+  }
+
+  async function loadModel(){ model = await handpose.load(); }
+
+  function acceptLetter(letter){
+    constructedWord += letter;
+    wordEl.textContent = constructedWord || '—';
+    speakText(letter);
+    sendToAppInventor('WORD:' + constructedWord);
+  }
+
+  async function analyzeFrame(){
+    if(!model || !video.videoWidth) return;
+    const predictions = await model.estimateHands(video);
+    draw(predictions);
+    if(predictions?.length && window.fp && window.Handsigns){
+      const GE = new fp.GestureEstimator(Object.values(Handsigns));
+      const est = await GE.estimate(predictions[0].landmarks, 7.5);
+      if(est.gestures?.length){
+        const max = est.gestures.reduce((a,b)=>a.confidence>b.confidence?a:b);
+        let letter = max.name?.[0]?.toUpperCase() || '';
+        if(letter){
+          if(letter === stableLetter) stableCount++;
+          else { stableLetter = letter; stableCount = 1; }
+          if(stableCount >= ACCEPT_THRESHOLD){ acceptLetter(letter); stableLetter=''; stableCount=0; }
+        } else { stableLetter=''; stableCount=0; }
+      } else { stableLetter=''; stableCount=0; }
+    } else { stableLetter=''; stableCount=0; }
+  }
+
+  // --- Button handlers ---
+  startBtn.addEventListener('click', async ()=>{
+    if(running) return;
+    await startCamera();
+    if(!model) await loadModel();
+    runInterval = setInterval(analyzeFrame, INTERVAL_MS);
+    running = true;
+  });
+
+  stopBtn.addEventListener('click', ()=>{
+    if(!running) return;
+    clearInterval(runInterval); runInterval=null; running=false;
+    stopCamera();
+  });
+
+  clearBtn.addEventListener('click', ()=>{
+    constructedWord=''; wordEl.textContent='—';
+    sendToAppInventor('WORD:' + constructedWord);
+  });
+
+  speakBtn.addEventListener('click', ()=> speakText(constructedWord));
+  </script>
+
+</body>
+</html>
+  <div id="videoWrap">
+    <video id="webcam" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div id="word">Show a sign...</div>
+    <button id="muteBtn">🔊</button>
+  </div>
+
+  <!-- TensorFlow.js and Fingerpose -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7/dist/handpose.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/fingerpose@0.1.0/dist/fingerpose.min.js"></script>
+
+  <!-- Helper scripts (must exist beside this file) -->
+  <script src="./handposeutil.js"></script>
+  <script src="./handsigns.js"></script>
+
+  <script>
+  const video = document.getElementById('webcam');
+  const canvas = document.getElementById('overlay');
+  const ctx = canvas.getContext('2d');
+  const wordEl = document.getElementById('word');
+  const muteBtn = document.getElementById('muteBtn');
+
+  let model = null;
+  let interval = null;
+  let running = false;
+  let constructedWord = '';
+  let stableLetter = '';
+  let stableCount = 0;
+  const ACCEPT_THRESHOLD = 3;
+  const INTERVAL_MS = 150;
+  let speakEnabled = true;
+
+  // --- Camera ---
+  async function startCamera() {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+    video.srcObject = stream;
+    await video.play();
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+  }
+
+  // --- Speak ---
+  function speak(text) {
+    if (!speakEnabled) return;
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      speechSynthesis.speak(u);
+    } catch {}
+  }
+
+  // --- Send to App Inventor ---
+  function sendToAppInventor(payload) {
+    try {
+      if (window.AppInventor?.setWebViewString) {
+        window.AppInventor.setWebViewString(payload);
+      } else if (window.parent?.AppInventor?.setWebViewString) {
+        window.parent.AppInventor.setWebViewString(payload);
+      }
+    } catch {}
+  }
+
+  // --- Accept letter ---
+  function acceptLetter(letter) {
+    constructedWord += letter;
+    wordEl.textContent = constructedWord;
+    speak(letter);
+    sendToAppInventor('WORD:' + constructedWord);
+  }
+
+  // --- Main detection ---
+  async function analyzeFrame() {
+    if (!model || !video.videoWidth) return;
+    const hands = await model.estimateHands(video);
+    if (window.drawHand) drawHand(hands, ctx);
+    if (hands.length === 0) {
+      stableLetter = ''; stableCount = 0; return;
+    }
+
+    const GE = new fp.GestureEstimator(Object.values(window.Handsigns));
+    const est = await GE.estimate(hands[0].landmarks, 7.5);
+    if (!est.gestures?.length) { stableLetter=''; stableCount=0; return; }
+
+    const max = est.gestures.reduce((a,b)=>a.confidence>b.confidence?a:b);
+    let letter = max.name?.[0]?.toUpperCase() || '';
+    if (!letter) return;
+
+    if (letter === stableLetter) {
+      stableCount++;
+      if (stableCount >= ACCEPT_THRESHOLD) {
+        acceptLetter(letter);
+        stableLetter=''; stableCount=0;
+      }
+    } else {
+      stableLetter = letter;
+      stableCount = 1;
+    }
+  }
+
+  // --- Toggle sound ---
+  muteBtn.addEventListener('click', ()=>{
+    speakEnabled = !speakEnabled;
+    muteBtn.textContent = speakEnabled ? '🔊' : '🔇';
+  });
+
+  // --- Load model and start ---
+  (async()=>{
+    await startCamera();
+    model = await handpose.load();
+    interval = setInterval(analyzeFrame, INTERVAL_MS);
+    running = true;
+  })();
+  </script>
+</body>
+</html>
   <div id="container">
     <h2 style="text-align:center">ASL Sign → Word (A–Z) — App Inventor Bridge</h2>
 
@@ -254,3 +638,4 @@
   </script>
 </body>
 </html>
+
