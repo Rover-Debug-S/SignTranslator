@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ASL Live - Sign to Word (App Inventor bridge)</title>
+  <style>
+    body { margin:0; font-family: system-ui, -apple-system, Roboto, Arial; background:#1f6aa5; color:white; display:flex; flex-direction:column; align-items:center; }
+    #container { width:100%; max-width:640px; padding:12px; box-sizing:border-box; }
+    #videoWrap { position:relative; width:100%; display:flex; justify-content:center; }
+    video { width:100%; max-width:560px; border-radius:8px; }
+    canvas { position:absolute; left:0; top:0; width:100%; max-width:560px; pointer-events:none; }
+    #word { margin-top:14px; font-size:26px; font-weight:700; text-align:center; color:#fff; }
+    #controls { margin-top:12px; display:flex; gap:8px; justify-content:center; }
+    button { padding:8px 12px; border-radius:8px; border:0; font-size:16px; }
+    #notice { font-size:12px; opacity:0.9; margin-top:8px; text-align:center; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <h2 style="text-align:center">ASL Sign → Word (A–Z) — App Inventor Bridge</h2>
+
+    <div id="videoWrap">
+      <video id="webcam" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <div id="word">—</div>
+
+    <div id="controls">
+      <button id="start">Start</button>
+      <button id="stop">Stop</button>
+      <button id="clear">Clear Word</button>
+      <button id="speak">Speak Word</button>
+    </div>
+
+    <div id="notice">
+      Make letters with your dominant hand. Page will speak each accepted letter and update the full word. The page will also send `WORD:<yourword>` to App Inventor via `AppInventor.setWebViewString`.
+    </div>
+  </div>
+
+  <!-- TensorFlow.js and fingerpose -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7/dist/handpose.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/fingerpose@0.1.0/dist/fingerpose.min.js"></script>
+
+  <!-- Helper files from the Handsign repo.
+       You must place handposeutil.js and handsigns.js in the same folder as this index.html.
+       I list the exact URLs below in 'Where to get helper files'. -->
+  <script src="./handposeutil.js"></script>
+  <script src="./handsigns.js"></script>
+
+  <script>
+  // Minimal sign→word page using Handpose + Fingerpose + Handsigns helper definitions.
+  // Requirements: handposeutil.js and handsigns.js (from syauqy/handsign-tensorflow repo) must exist next to this index.html.
+
+  const video = document.getElementById('webcam');
+  const overlay = document.getElementById('overlay');
+  const ctx = overlay.getContext('2d');
+  const wordEl = document.getElementById('word');
+  const startBtn = document.getElementById('start');
+  const stopBtn = document.getElementById('stop');
+  const clearBtn = document.getElementById('clear');
+  const speakBtn = document.getElementById('speak');
+
+  let model = null;
+  let runInterval = null;
+  let running = false;
+  let constructedWord = '';
+  let stableLetter = '';
+  let stableCount = 0;
+  const ACCEPT_THRESHOLD = 3; // require same letter repeated this many times
+  const INTERVAL_MS = 150;
+
+  // Draw wrapper uses drawHand from handposeutil.js (from Handsign repo)
+  function draw(hand) {
+    overlay.width = video.videoWidth;
+    overlay.height = video.videoHeight;
+    ctx.clearRect(0,0,overlay.width,overlay.height);
+    if (window.drawHand && hand) {
+      drawHand(hand, ctx); // provided by handposeutil.js
+    }
+  }
+
+  async function startCamera(){
+    try{
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio:false });
+      video.srcObject = stream;
+      await video.play();
+      overlay.width = video.videoWidth;
+      overlay.height = video.videoHeight;
+    }catch(e){
+      alert('Camera error: ' + e.message + '. Make sure you allow camera access and open page over HTTPS.');
+      return;
+    }
+  }
+
+  async function stopCamera(){
+    try{
+      const s = video.srcObject;
+      if (s) s.getTracks().forEach(t=>t.stop());
+      video.pause();
+      video.srcObject = null;
+    }catch(e){}
+  }
+
+  function sendToAppInventor(payload){
+    try{
+      if (window.AppInventor && AppInventor.setWebViewString) {
+        AppInventor.setWebViewString(payload);
+      } else if (window.parent && window.parent.AppInventor && window.parent.AppInventor.setWebViewString) {
+        window.parent.AppInventor.setWebViewString(payload);
+      } else {
+        // not embedded — fine for testing in browser
+        //console.log('AppInventor payload:', payload);
+      }
+    }catch(e){ console.warn(e); }
+  }
+
+  function speakText(t){
+    try{
+      const u = new SpeechSynthesisUtterance(t);
+      window.speechSynthesis.speak(u);
+    }catch(e){}
+  }
+
+  async function loadModel(){
+    // handpose is loaded as window.handpose when we included the CDN script above.
+    model = await handpose.load();
+    console.log('handpose loaded', model);
+  }
+
+  function acceptLetter(letter){
+    // append to constructed word
+    constructedWord += letter;
+    wordEl.innerText = constructedWord || '—';
+    // speak the letter
+    speakText(letter);
+    // send full word to App Inventor
+    sendToAppInventor('WORD:' + constructedWord);
+  }
+
+  // Main detection loop
+  async function analyzeFrame(){
+    if (!model) return;
+    if (!video || !video.videoWidth) return;
+    const predictions = await model.estimateHands(video);
+    draw(predictions);
+    if (predictions && predictions.length > 0) {
+      // create Fingerpose estimator with the finger gestures loaded from handsigns.js
+      // handsigns.js should define an object "Handsigns" with properties like aSign, bSign, ... (same names used in Handsign repo)
+      if (window.fp && window.Handsigns) {
+        const GE = new fp.GestureEstimator([
+          fp.Gestures.ThumbsUpGesture,
+          Handsigns.aSign,
+          Handsigns.bSign,
+          Handsigns.cSign,
+          Handsigns.dSign,
+          Handsigns.eSign,
+          Handsigns.fSign,
+          Handsigns.gSign,
+          Handsigns.hSign,
+          Handsigns.iSign,
+          Handsigns.jSign,
+          Handsigns.kSign,
+          Handsigns.lSign,
+          Handsigns.mSign,
+          Handsigns.nSign,
+          Handsigns.oSign,
+          Handsigns.pSign,
+          Handsigns.qSign,
+          Handsigns.rSign,
+          Handsigns.sSign,
+          Handsigns.tSign,
+          Handsigns.uSign,
+          Handsigns.vSign,
+          Handsigns.wSign,
+          Handsigns.xSign,
+          Handsigns.ySign,
+          Handsigns.zSign,
+        ]);
+
+        const est = await GE.estimate(predictions[0].landmarks, 7.5);
+        if (est && est.gestures && est.gestures.length > 0) {
+          const confidences = est.gestures.map(g=>g.confidence);
+          const idx = confidences.indexOf(Math.max(...confidences));
+          const name = est.gestures[idx].name || '';
+          // normalize to letter
+          let letter = '';
+          if (typeof name === 'string') {
+            const m = name.match(/[a-zA-Z]/);
+            if (m) letter = m[0].toUpperCase();
+          }
+          if (letter) {
+            if (stableLetter === letter) {
+              stableCount++;
+            } else {
+              stableLetter = letter;
+              stableCount = 1;
+            }
+            if (stableCount >= ACCEPT_THRESHOLD) {
+              acceptLetter(letter);
+              stableLetter = '';
+              stableCount = 0;
+            }
+          } else {
+            stableLetter = '';
+            stableCount = 0;
+          }
+        } else {
+          stableLetter = '';
+          stableCount = 0;
+        }
+      } else {
+        // handsigns.js or fingerpose not found — notify user
+        console.warn('fingerpose or Handsigns not available. Make sure handsigns.js and fingerpose are loaded.');
+      }
+    } else {
+      // no hand
+      stableLetter = '';
+      stableCount = 0;
+    }
+  }
+
+  // Control handlers
+  startBtn.addEventListener('click', async ()=>{
+    if (running) return;
+    await startCamera();
+    if (!model) await loadModel();
+    runInterval = setInterval(analyzeFrame, INTERVAL_MS);
+    running = true;
+  });
+
+  stopBtn.addEventListener('click', async ()=>{
+    if (!running) return;
+    clearInterval(runInterval);
+    runInterval = null;
+    running = false;
+    await stopCamera();
+  });
+
+  clearBtn.addEventListener('click', ()=>{
+    constructedWord = '';
+    wordEl.innerText = '—';
+    sendToAppInventor('WORD:' + constructedWord);
+  });
+
+  speakBtn.addEventListener('click', ()=>{
+    speakText(constructedWord || '');
+  });
+
+  // Auto-start if page is opened directly and user interacts (some browsers require user interaction)
+  // You can call startBtn.click() manually to start.
+  </script>
+</body>
+</html>
